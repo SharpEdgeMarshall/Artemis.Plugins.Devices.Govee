@@ -1,15 +1,15 @@
 {
     "Guid": "D6B3B08C-C76F-4D47-9A9D-870F68180263",
-    "Name": "Plugin Name",
-    "Description": "Plugin Description",
-    "Author": "",
-    "Website": "",
-    "Repository": "",
-    "Icon": "QuestionMark",
+    "Name": "Govee Devices",
+    "Description": "Govee Bluetooth RGB devices",
+    "Author": "SharpEdgeMarshall",
+    "Website": "https://github.com/SharpEdgeMarshall/Artemis.Plugins.Devices.Govee",
+    "Repository": "https://github.com/SharpEdgeMarshall/Artemis.Plugins.Devices.Govee",
+    "Icon": "Resources/logo.png",
     "Version": "1.0.0.0",
     "Main": "Artemis.Plugins.Devices.Govee.dll",
     "AutoEnableProperties": true,
     "RequiresAdmin": false,
-    "Platforms": "Windows,Linux,OSX",
+    "Platforms": "Windows",
     "Api": "1.0.0"
 }

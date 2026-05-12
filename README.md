@@ -1,7 +1,5 @@
-# Congratulations, you can now start developing your plugin!
+# Artemis Plugin for Govee Bluetooth Lights
 
-Next steps:
-- Change the solution name to something more meaningful
-- Fill in the plugin.json file with the correct information
-- Fix the build.yml so it uploads the built plugin
-- Update this README.md file with relevant information about your plugin
+This plugin will load all Govee lights it can find.
+
+It's still pretty buggy sometimes the connection is lost.
