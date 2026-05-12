@@ -1,9 +1,9 @@
-name: Build Plugin
+name: Release Plugin
 
 on:
   push:
-    branches:
-      - master
+    tags:
+      - 'v*'
 
 jobs:
   build:
@@ -19,8 +19,7 @@ jobs:
       - name: Zip plugin
         run: zip -r Artemis.Plugins.Devices.Govee.zip plugin-output/
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v3
+      - name: Create release
+        uses: softprops/action-gh-release@v2
         with:
-          name: Artemis.Plugins.Devices.Govee
-          path: Artemis.Plugins.Devices.Govee.zip
+          files: Artemis.Plugins.Devices.Govee.zip
