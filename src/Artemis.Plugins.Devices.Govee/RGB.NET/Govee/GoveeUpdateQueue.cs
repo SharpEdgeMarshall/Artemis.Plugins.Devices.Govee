@@ -85,6 +85,7 @@ public class GoveeUpdateQueue : UpdateQueue
         _writeCharacteristic = null;
         _selectedServiceUuid = null;
         _selectedCharacteristicUuid = null;
+        DetachDeviceEvents();
         _device?.Dispose();
         _device = null;
 
@@ -225,6 +226,7 @@ public class GoveeUpdateQueue : UpdateQueue
             _writeCharacteristic = null;
             _selectedServiceUuid = null;
             _selectedCharacteristicUuid = null;
+            DetachDeviceEvents();
             _device?.Dispose();
             _device = null;
 
@@ -235,6 +237,8 @@ public class GoveeUpdateQueue : UpdateQueue
                 _logger.Warning("[{Address}] BluetoothLEDevice.FromBluetoothAddressAsync returned null", $"{_bluetoothAddress:X12}");
                 return false;
             }
+
+            AttachDeviceEvents(_device);
 
             _logger.Debug("[{Address}] Requesting all GATT services...", $"{_bluetoothAddress:X12}");
             GattDeviceServicesResult servicesResult = await _device.GetGattServicesAsync(BluetoothCacheMode.Uncached);
@@ -306,6 +310,9 @@ public class GoveeUpdateQueue : UpdateQueue
                 return false;
 
             _isConnected = true;
+            byte[] powerOnPacket = _protocol.BuildPowerPacket(true);
+            _ = _writeCharacteristic.WriteValueAsync(powerOnPacket.AsBuffer(), GattWriteOption.WriteWithoutResponse);
+            _lastSentPowerOff = false;
             StartKeepAliveLoop();
             _logger.Information("[{Address}] Connected and ready ({Protocol}) using service {ServiceUuid} and characteristic {CharacteristicUuid}",
                 $"{_bluetoothAddress:X12}", _protocol.Name, _selectedServiceUuid, _selectedCharacteristicUuid);
@@ -337,6 +344,29 @@ public class GoveeUpdateQueue : UpdateQueue
         _keepAliveCts?.Dispose();
         _keepAliveCts = null;
         _keepAliveTask = null;
+    }
+
+    private void AttachDeviceEvents(BluetoothLEDevice device)
+    {
+        device.ConnectionStatusChanged -= Device_ConnectionStatusChanged;
+        device.ConnectionStatusChanged += Device_ConnectionStatusChanged;
+    }
+
+    private void DetachDeviceEvents()
+    {
+        if (_device != null)
+            _device.ConnectionStatusChanged -= Device_ConnectionStatusChanged;
+    }
+
+    private void Device_ConnectionStatusChanged(BluetoothLEDevice sender, object args)
+    {
+        if (sender.ConnectionStatus == BluetoothConnectionStatus.Connected)
+            return;
+
+        _logger.Warning("[{Address}] Bluetooth connection status changed to {Status}, triggering reconnect", $"{_bluetoothAddress:X12}", sender.ConnectionStatus);
+        _isConnected = false;
+        StopKeepAliveLoop();
+        TriggerReconnect();
     }
 
     private async Task KeepAliveLoopAsync(CancellationToken cancellationToken)
