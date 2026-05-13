@@ -3,6 +3,7 @@ using System.Runtime.InteropServices.WindowsRuntime;
 using System.Threading;
 using System.Threading.Tasks;
 using Artemis.Plugins.Devices.Govee.RGB.NET;
+using Artemis.Plugins.Devices.Govee.RGB.NET.Protocols;
 using RGB.NET.Core;
 using Serilog;
 using Windows.Devices.Bluetooth;
@@ -11,39 +12,47 @@ using Windows.Devices.Bluetooth.GenericAttributeProfile;
 namespace Artemis.Plugins.Devices.Govee.RGB.NET.Govee;
 
 /// <summary>
-/// Handles sending color updates to a Govee device over BLE.
+/// Handles sending color updates to a BLE light device.
 /// </summary>
 public class GoveeUpdateQueue : UpdateQueue
 {
-    private static readonly Guid ServiceUuid = new("00010203-0405-0607-0809-0a0b0c0d1910");
-    private static readonly Guid CharacteristicUuid = new("00010203-0405-0607-0809-0a0b0c0d2b11");
-    private static readonly TimeSpan KeepAliveInterval = TimeSpan.FromSeconds(2);
-
     private readonly ulong _bluetoothAddress;
+    private readonly ILightProtocol _protocol;
     private readonly GoveeRgbDeviceProvider _deviceProvider;
     private readonly ILogger _logger;
+
     private BluetoothLEDevice? _device;
     private GattCharacteristic? _writeCharacteristic;
+    private Guid? _selectedServiceUuid;
+    private Guid? _selectedCharacteristicUuid;
     private bool _isConnected;
+
     private CancellationTokenSource? _reconnectCts;
     private Task? _reconnectTask;
     private bool _isReconnecting;
     private int _reconnectAttempt;
     private bool _hasLoggedAccessDenied;
+
     private bool _lastSentPowerOff;
     private CancellationTokenSource? _keepAliveCts;
     private Task? _keepAliveTask;
 
-    public GoveeUpdateQueue(IDeviceUpdateTrigger updateTrigger, ulong bluetoothAddress, GoveeRgbDeviceProvider deviceProvider, ILogger logger)
+    public GoveeUpdateQueue(
+        IDeviceUpdateTrigger updateTrigger,
+        ulong bluetoothAddress,
+        ILightProtocol protocol,
+        GoveeRgbDeviceProvider deviceProvider,
+        ILogger logger)
         : base(updateTrigger)
     {
         _bluetoothAddress = bluetoothAddress;
+        _protocol = protocol;
         _deviceProvider = deviceProvider;
         _logger = logger;
     }
 
     /// <summary>
-    /// Connects to the Govee device and resolves the GATT write characteristic.
+    /// Starts the connection/reconnection process.
     /// </summary>
     public void Connect()
     {
@@ -62,7 +71,7 @@ public class GoveeUpdateQueue : UpdateQueue
     }
 
     /// <summary>
-    /// Disconnects from the Govee device.
+    /// Disconnects from the device and stops background workers.
     /// </summary>
     public void Disconnect()
     {
@@ -70,10 +79,15 @@ public class GoveeUpdateQueue : UpdateQueue
         _isReconnecting = false;
         _reconnectAttempt = 0;
         _lastSentPowerOff = false;
+
         StopKeepAliveLoop();
+
         _writeCharacteristic = null;
+        _selectedServiceUuid = null;
+        _selectedCharacteristicUuid = null;
         _device?.Dispose();
         _device = null;
+
         _reconnectCts?.Cancel();
         _reconnectCts?.Dispose();
         _reconnectCts = null;
@@ -101,7 +115,7 @@ public class GoveeUpdateQueue : UpdateQueue
             {
                 if (!_lastSentPowerOff)
                 {
-                    byte[] powerOffPacket = BuildPowerPacket(false);
+                    byte[] powerOffPacket = _protocol.BuildPowerPacket(false);
                     _ = _writeCharacteristic.WriteValueAsync(powerOffPacket.AsBuffer(), GattWriteOption.WriteWithoutResponse);
                     _lastSentPowerOff = true;
                 }
@@ -109,23 +123,28 @@ public class GoveeUpdateQueue : UpdateQueue
             }
 
             byte brightness = Math.Max(r, Math.Max(g, b));
-
-            // Split intensity and color so the dedicated brightness packet controls dimming.
             byte normalizedR = (byte)Math.Clamp((r * 255) / brightness, 0, 255);
             byte normalizedG = (byte)Math.Clamp((g * 255) / brightness, 0, 255);
             byte normalizedB = (byte)Math.Clamp((b * 255) / brightness, 0, 255);
 
             if (_lastSentPowerOff)
             {
-                byte[] powerOnPacket = BuildPowerPacket(true);
+                byte[] powerOnPacket = _protocol.BuildPowerPacket(true);
                 _ = _writeCharacteristic.WriteValueAsync(powerOnPacket.AsBuffer(), GattWriteOption.WriteWithoutResponse);
                 _lastSentPowerOff = false;
             }
 
-            byte[] brightnessPacket = BuildBrightnessPacket(brightness);
-            _ = _writeCharacteristic.WriteValueAsync(brightnessPacket.AsBuffer(), GattWriteOption.WriteWithoutResponse);
+            if (_protocol.UsesDedicatedBrightness)
+            {
+                byte[]? brightnessPacket = _protocol.BuildBrightnessPacket(brightness);
+                if (brightnessPacket != null)
+                    _ = _writeCharacteristic.WriteValueAsync(brightnessPacket.AsBuffer(), GattWriteOption.WriteWithoutResponse);
+            }
 
-            byte[] colorPacket = BuildColorPacket(normalizedR, normalizedG, normalizedB);
+            byte colorR = _protocol.UsesDedicatedBrightness ? normalizedR : r;
+            byte colorG = _protocol.UsesDedicatedBrightness ? normalizedG : g;
+            byte colorB = _protocol.UsesDedicatedBrightness ? normalizedB : b;
+            byte[] colorPacket = _protocol.BuildColorPacket(colorR, colorG, colorB);
             _ = _writeCharacteristic.WriteValueAsync(colorPacket.AsBuffer(), GattWriteOption.WriteWithoutResponse);
             return true;
         }
@@ -139,9 +158,6 @@ public class GoveeUpdateQueue : UpdateQueue
         }
     }
 
-    /// <summary>
-    /// Triggers a background reconnection attempt with exponential backoff.
-    /// </summary>
     private void TriggerReconnect()
     {
         if (_isReconnecting)
@@ -156,9 +172,6 @@ public class GoveeUpdateQueue : UpdateQueue
         _reconnectTask = RunReconnectLoopAsync(_reconnectCts.Token, immediateFirstAttempt: false);
     }
 
-    /// <summary>
-    /// Attempts to reconnect with exponential backoff (1s, 2s, 4s, 8s, 16s, then 30s).
-    /// </summary>
     private async Task RunReconnectLoopAsync(CancellationToken cancellationToken, bool immediateFirstAttempt)
     {
         try
@@ -210,6 +223,8 @@ public class GoveeUpdateQueue : UpdateQueue
         {
             _isConnected = false;
             _writeCharacteristic = null;
+            _selectedServiceUuid = null;
+            _selectedCharacteristicUuid = null;
             _device?.Dispose();
             _device = null;
 
@@ -231,13 +246,17 @@ public class GoveeUpdateQueue : UpdateQueue
             foreach (GattDeviceService s in servicesResult.Services)
             {
                 _logger.Debug("[{Address}] Found service: {Uuid}", $"{_bluetoothAddress:X12}", s.Uuid);
-                if (s.Uuid == ServiceUuid)
+                if (_protocol.MatchesServiceUuid(s.Uuid))
+                {
                     service = s;
+                    _selectedServiceUuid = s.Uuid;
+                    break;
+                }
             }
 
             if (service == null)
             {
-                _logger.Warning("[{Address}] Target service {Uuid} not found", $"{_bluetoothAddress:X12}", ServiceUuid);
+                _logger.Warning("[{Address}] No matching service found for protocol {Protocol}", $"{_bluetoothAddress:X12}", _protocol.Name);
                 return false;
             }
 
@@ -252,16 +271,34 @@ public class GoveeUpdateQueue : UpdateQueue
             if (charsResult.Status != GattCommunicationStatus.Success || charsResult.Characteristics.Count == 0)
                 return false;
 
+            GattCharacteristic? fallbackCharacteristic = null;
             foreach (GattCharacteristic c in charsResult.Characteristics)
             {
                 _logger.Debug("[{Address}] Found characteristic: {Uuid}", $"{_bluetoothAddress:X12}", c.Uuid);
-                if (c.Uuid == CharacteristicUuid)
-                    _writeCharacteristic = c;
+                if (_protocol.MatchesCharacteristicUuid(c.Uuid))
+                {
+                    fallbackCharacteristic ??= c;
+
+                    bool canWriteNoResponse = c.CharacteristicProperties.HasFlag(GattCharacteristicProperties.WriteWithoutResponse);
+                    bool canWrite = c.CharacteristicProperties.HasFlag(GattCharacteristicProperties.Write);
+                    if (canWriteNoResponse || canWrite)
+                    {
+                        _writeCharacteristic = c;
+                        _selectedCharacteristicUuid = c.Uuid;
+                        break;
+                    }
+                }
+            }
+
+            if (_writeCharacteristic == null && fallbackCharacteristic != null)
+            {
+                _writeCharacteristic = fallbackCharacteristic;
+                _selectedCharacteristicUuid = fallbackCharacteristic.Uuid;
             }
 
             if (_writeCharacteristic == null)
             {
-                _logger.Warning("[{Address}] Target characteristic {Uuid} not found", $"{_bluetoothAddress:X12}", CharacteristicUuid);
+                _logger.Warning("[{Address}] No matching characteristic found for protocol {Protocol}", $"{_bluetoothAddress:X12}", _protocol.Name);
                 return false;
             }
 
@@ -270,7 +307,8 @@ public class GoveeUpdateQueue : UpdateQueue
 
             _isConnected = true;
             StartKeepAliveLoop();
-            _logger.Information("[{Address}] Connected and ready", $"{_bluetoothAddress:X12}");
+            _logger.Information("[{Address}] Connected and ready ({Protocol}) using service {ServiceUuid} and characteristic {CharacteristicUuid}",
+                $"{_bluetoothAddress:X12}", _protocol.Name, _selectedServiceUuid, _selectedCharacteristicUuid);
             return true;
         }
         catch (Exception ex)
@@ -285,6 +323,10 @@ public class GoveeUpdateQueue : UpdateQueue
     private void StartKeepAliveLoop()
     {
         StopKeepAliveLoop();
+
+        if (_protocol.KeepAliveInterval == null || _protocol.BuildKeepAlivePacket() == null)
+            return;
+
         _keepAliveCts = new CancellationTokenSource();
         _keepAliveTask = KeepAliveLoopAsync(_keepAliveCts.Token);
     }
@@ -303,12 +345,15 @@ public class GoveeUpdateQueue : UpdateQueue
         {
             while (!cancellationToken.IsCancellationRequested)
             {
-                await Task.Delay(KeepAliveInterval, cancellationToken);
+                await Task.Delay(_protocol.KeepAliveInterval!.Value, cancellationToken);
 
                 if (!_isConnected || _writeCharacteristic == null)
                     return;
 
-                byte[] keepAlivePacket = BuildKeepAlivePacket();
+                byte[]? keepAlivePacket = _protocol.BuildKeepAlivePacket();
+                if (keepAlivePacket == null)
+                    return;
+
                 GattCommunicationStatus status = await _writeCharacteristic.WriteValueAsync(keepAlivePacket.AsBuffer(), GattWriteOption.WriteWithoutResponse);
                 if (status != GattCommunicationStatus.Success)
                 {
@@ -338,73 +383,5 @@ public class GoveeUpdateQueue : UpdateQueue
 
         int backoffIndex = Math.Min(attempt - 1, 5);
         return Math.Min(1000 * (int)Math.Pow(2, backoffIndex), 30000);
-    }
-
-    /// <summary>
-    /// Builds a Govee BLE color command packet.
-    /// Packet format: 0x33 0x05 0x02 R G B [padding] XOR
-    /// </summary>
-    public static byte[] BuildColorPacket(byte r, byte g, byte b)
-    {
-        byte[] packet = new byte[20];
-        packet[0] = 0x33; // Command indicator
-        packet[1] = 0x05; // Color command
-        packet[2] = 0x02; // Manual color mode
-        packet[3] = r;
-        packet[4] = g;
-        packet[5] = b;
-        // bytes 6-18 are zero-padded
-        packet[19] = CalculateXor(packet);
-        return packet;
-    }
-
-    /// <summary>
-    /// Builds a Govee BLE power command packet.
-    /// </summary>
-    public static byte[] BuildPowerPacket(bool on)
-    {
-        byte[] packet = new byte[20];
-        packet[0] = 0x33;
-        packet[1] = 0x01; // Power command
-        packet[2] = (byte)(on ? 0x01 : 0x00);
-        packet[19] = CalculateXor(packet);
-        return packet;
-    }
-
-    /// <summary>
-    /// Builds a Govee BLE brightness command packet.
-    /// Brightness range: 0x01 (minimum) to 0xFE (maximum).
-    /// </summary>
-    public static byte[] BuildBrightnessPacket(byte brightness)
-    {
-        byte[] packet = new byte[20];
-        packet[0] = 0x33;
-        packet[1] = 0x04; // Brightness command
-        packet[2] = Math.Clamp(brightness, (byte)0x01, (byte)0xFE);
-        packet[19] = CalculateXor(packet);
-        return packet;
-    }
-
-    /// <summary>
-    /// Builds a keep-alive packet (sent every ~2 seconds by the app).
-    /// </summary>
-    public static byte[] BuildKeepAlivePacket()
-    {
-        byte[] packet = new byte[20];
-        packet[0] = 0xAA;
-        packet[1] = 0x01;
-        packet[19] = CalculateXor(packet);
-        return packet;
-    }
-
-    /// <summary>
-    /// Calculates the XOR checksum for a Govee command packet.
-    /// </summary>
-    private static byte CalculateXor(byte[] packet)
-    {
-        byte xor = 0;
-        for (int i = 0; i < packet.Length - 1; i++)
-            xor ^= packet[i];
-        return xor;
     }
 }
